@@ -1418,3 +1418,199 @@ export class NomadCanvasProvider {
     this.doc.destroy();
   }
 }
+
+import {
+  CrdtFrameMessageType,
+  CrdtFrameReassembler,
+  encodeCrdtFrames,
+} from "./dataChannelFraming";
+
+export const DELTA_SYNC_REMOTE_ORIGIN = "crdt-delta-sync-remote";
+
+export interface DeltaSyncMetrics {
+  stateVectorBytesSent: number;
+  deltaBytesSent: number;
+  fullStateBytesEquivalent: number;
+  framesSent: number;
+  framesReceived: number;
+  duplicateUpdatesIgnored: number;
+}
+
+function fingerprintUpdate(bytes: Uint8Array): string {
+  let hash = 0x811c9ce5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${bytes.length}:${(hash >>> 0).toString(16)}`;
+}
+
+export class CrdtDeltaSyncSession {
+  public readonly doc: Y.Doc;
+  public readonly peerId: string;
+  private readonly sendFrame: (frame: Uint8Array) => void;
+  private readonly maxChunkPayloadSize?: number;
+  private readonly reassembler = new CrdtFrameReassembler();
+  private readonly appliedFingerprints = new Set<string>();
+  private nextMessageId = 1;
+  private lastKnownRemoteStateVector: Uint8Array | null = null;
+
+  public readonly metrics: DeltaSyncMetrics = {
+    stateVectorBytesSent: 0,
+    deltaBytesSent: 0,
+    fullStateBytesEquivalent: 0,
+    framesSent: 0,
+    framesReceived: 0,
+    duplicateUpdatesIgnored: 0,
+  };
+
+  constructor(options: {
+    doc: Y.Doc;
+    peerId: string;
+    sendFrame: (frame: Uint8Array) => void;
+    maxChunkPayloadSize?: number;
+  }) {
+    this.doc = options.doc;
+    this.peerId = options.peerId;
+    this.sendFrame = options.sendFrame;
+    this.maxChunkPayloadSize = options.maxChunkPayloadSize;
+  }
+
+  private allocateMessageId(): number {
+    const id = this.nextMessageId >>> 0;
+    this.nextMessageId = (this.nextMessageId + 1) >>> 0 || 1;
+    return id;
+  }
+
+  public initiateStateVectorHandshake(): Uint8Array {
+    const stateVector = Y.encodeStateVector(this.doc);
+    const frames = encodeCrdtFrames(stateVector, {
+      messageId: this.allocateMessageId(),
+      messageType: CrdtFrameMessageType.STATE_VECTOR,
+      maxChunkPayloadSize: this.maxChunkPayloadSize,
+    });
+
+    this.metrics.stateVectorBytesSent += stateVector.byteLength;
+    this.metrics.framesSent += frames.length;
+
+    for (const frame of frames) {
+      this.sendFrame(frame);
+    }
+    return stateVector;
+  }
+
+  public sendDeltaForStateVector(remoteStateVector: Uint8Array): Uint8Array {
+    this.lastKnownRemoteStateVector = new Uint8Array(remoteStateVector);
+    const delta = Y.encodeStateAsUpdate(this.doc, remoteStateVector);
+    const fullEquivalent = Y.encodeStateAsUpdate(this.doc);
+
+    this.metrics.deltaBytesSent += delta.byteLength;
+    this.metrics.fullStateBytesEquivalent += fullEquivalent.byteLength;
+
+    this.appliedFingerprints.add(fingerprintUpdate(delta));
+
+    const frames = encodeCrdtFrames(delta, {
+      messageId: this.allocateMessageId(),
+      messageType: CrdtFrameMessageType.DELTA_UPDATE,
+      maxChunkPayloadSize: this.maxChunkPayloadSize,
+    });
+
+    this.metrics.framesSent += frames.length;
+    for (const frame of frames) {
+      this.sendFrame(frame);
+    }
+    return delta;
+  }
+
+  public broadcastLocalDelta(update: Uint8Array): void {
+    if (!update || update.byteLength === 0) return;
+    this.appliedFingerprints.add(fingerprintUpdate(update));
+
+    const frames = encodeCrdtFrames(update, {
+      messageId: this.allocateMessageId(),
+      messageType: CrdtFrameMessageType.DELTA_UPDATE,
+      maxChunkPayloadSize: this.maxChunkPayloadSize,
+    });
+
+    this.metrics.deltaBytesSent += update.byteLength;
+    this.metrics.framesSent += frames.length;
+    for (const frame of frames) {
+      this.sendFrame(frame);
+    }
+  }
+
+  public receiveFrame(rawFrame: Uint8Array | ArrayBuffer): {
+    completed: boolean;
+    messageType?: CrdtFrameMessageType;
+    appliedDelta?: boolean;
+  } {
+    this.metrics.framesReceived += 1;
+    const message = this.reassembler.pushFrame(rawFrame);
+    if (!message) {
+      return { completed: false };
+    }
+
+    if (message.messageType === CrdtFrameMessageType.STATE_VECTOR) {
+      this.sendDeltaForStateVector(message.payload);
+      return {
+        completed: true,
+        messageType: CrdtFrameMessageType.STATE_VECTOR,
+      };
+    }
+
+    if (
+      message.messageType === CrdtFrameMessageType.DELTA_UPDATE ||
+      message.messageType === CrdtFrameMessageType.FULL_SYNC_FALLBACK
+    ) {
+      const applied = this.applyDeltaIdempotently(message.payload);
+      return {
+        completed: true,
+        messageType: message.messageType,
+        appliedDelta: applied,
+      };
+    }
+
+    return { completed: true, messageType: message.messageType };
+  }
+
+  public applyDeltaIdempotently(delta: Uint8Array): boolean {
+    if (!delta || delta.byteLength === 0) {
+      this.metrics.duplicateUpdatesIgnored += 1;
+      return false;
+    }
+
+    const fp = fingerprintUpdate(delta);
+    if (this.appliedFingerprints.has(fp)) {
+      this.metrics.duplicateUpdatesIgnored += 1;
+      return false;
+    }
+
+    const beforeVector = Y.encodeStateVector(this.doc);
+    Y.applyUpdate(this.doc, delta, DELTA_SYNC_REMOTE_ORIGIN);
+    const afterVector = Y.encodeStateVector(this.doc);
+
+    this.appliedFingerprints.add(fp);
+    if (this.appliedFingerprints.size > 1024) {
+      const oldest = this.appliedFingerprints.values().next().value;
+      if (oldest !== undefined) {
+        this.appliedFingerprints.delete(oldest);
+      }
+    }
+
+    if (
+      beforeVector.byteLength === afterVector.byteLength &&
+      beforeVector.every((b, idx) => b === afterVector[idx])
+    ) {
+      this.metrics.duplicateUpdatesIgnored += 1;
+      return false;
+    }
+
+    return true;
+  }
+
+  public getLastKnownRemoteStateVector(): Uint8Array | null {
+    return this.lastKnownRemoteStateVector
+      ? new Uint8Array(this.lastKnownRemoteStateVector)
+      : null;
+  }
+}
