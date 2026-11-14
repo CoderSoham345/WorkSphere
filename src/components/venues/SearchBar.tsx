@@ -11,6 +11,7 @@ export interface SearchBarProps {
   placeholder?: string;
   onSelect?: (venue: VenueSearchResult) => void;
   onSearch?: (query: string) => void;
+  onQueryChange?: (query: string) => void;
   className?: string;
   debounceMs?: number;
   initialQuery?: string;
@@ -37,6 +38,7 @@ export function SearchBar({
   placeholder = "Search venues by name, address, or tag...",
   onSelect,
   onSearch,
+  onQueryChange,
   className = "",
   debounceMs = 250,
   initialQuery = "",
@@ -162,18 +164,28 @@ export function SearchBar({
       const target = typeof rawQuery === "string" ? rawQuery : query;
       const trimmed = trimSearchQuery(target);
       if (!trimmed) {
-        // Prevent empty queries containing only spaces from triggering search fetch
         clear();
+        onQueryChange?.("");
         onSearch?.("");
         updateUrlQuery("");
         setIsOpen(false);
         return;
       }
+      onQueryChange?.(trimmed);
       onSearch?.(trimmed);
       updateUrlQuery(trimmed);
       void search(trimmed);
     },
-    [query, clear, onSearch, updateUrlQuery, search],
+    [query, clear, onQueryChange, onSearch, updateUrlQuery, search],
+  );
+
+  const handleFormSubmit = useCallback(
+    (e: React.FormEvent<HTMLFormElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      handleSearchSubmit();
+    },
+    [handleSearchSubmit],
   );
 
   const handleSelectVenue = (venue: VenueSearchResult) => {
@@ -210,15 +222,17 @@ export function SearchBar({
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       e.preventDefault();
+      e.stopPropagation();
       handleSearchSubmit();
     } else if (e.key === "Escape") {
       e.preventDefault();
+      e.stopPropagation();
       cursorRef.current = { start: null, end: null };
       clear();
+      onQueryChange?.("");
       onSearch?.("");
       updateUrlQuery("");
       setIsOpen(false);
-      inputRef.current?.blur();
     }
   };
 
@@ -228,7 +242,12 @@ export function SearchBar({
       className={`relative w-full ${className}`}
       data-testid="search-bar"
     >
-      <div className="relative flex items-center">
+      <form
+        role="search"
+        data-testid="search-bar-form"
+        onSubmit={handleFormSubmit}
+        className="relative flex items-center"
+      >
         <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 dark:text-zinc-500 pointer-events-none" />
         <input
           ref={inputRef}
@@ -298,7 +317,7 @@ export function SearchBar({
             </button>
           )}
         </div>
-      </div>
+      </form>
 
       {/* Optional mobile amenity filter pill row below search bar */}
       {showAmenityPills && (

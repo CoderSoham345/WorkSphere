@@ -32,11 +32,9 @@ describe("SearchBar component (#4401, #4404)", () => {
     expect(input).toHaveAttribute("placeholder", "Find your workplace...");
     expect(input).toHaveValue("");
 
-    // Clear button should not be present when query is empty
     expect(
       screen.queryByTestId("search-bar-clear-btn"),
     ).not.toBeInTheDocument();
-    // Shortcut badge should be visible when query is empty
     expect(screen.getByTestId("search-bar-shortcut-badge")).toBeInTheDocument();
   });
 
@@ -92,11 +90,20 @@ describe("SearchBar component (#4401, #4404)", () => {
     expect(focusSpy).toHaveBeenCalled();
   });
 
-  it("clears search input, triggers onSearch, and blurs input when pressing Escape key", () => {
+  it("clears search input and resets filter without blurring input when pressing Escape key", () => {
     const onSearch = jest.fn();
-    render(<SearchBar initialQuery="Coworking Space" onSearch={onSearch} />);
+    const onQueryChange = jest.fn();
+    render(
+      <SearchBar
+        initialQuery="Coworking Space"
+        onSearch={onSearch}
+        onQueryChange={onQueryChange}
+      />,
+    );
 
-    const input = screen.getByTestId("search-bar-input");
+    const input = screen.getByTestId("search-bar-input") as HTMLInputElement;
+    input.focus();
+    expect(document.activeElement).toBe(input);
     expect(input).toHaveValue("Coworking Space");
 
     const blurSpy = jest.spyOn(input, "blur");
@@ -106,10 +113,12 @@ describe("SearchBar component (#4401, #4404)", () => {
 
     expect(input).toHaveValue("");
     expect(onSearch).toHaveBeenCalledWith("");
+    expect(onQueryChange).toHaveBeenCalledWith("");
     expect(
       screen.queryByTestId("search-bar-clear-btn"),
     ).not.toBeInTheDocument();
-    expect(blurSpy).toHaveBeenCalled();
+    expect(blurSpy).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(input);
   });
 
   it("closes results dropdown on Escape key when query is empty", () => {
@@ -278,7 +287,7 @@ describe("SearchBar component (#4401, #4404)", () => {
       expect(trimSearchQuery("")).toBe("");
     });
 
-    it("trims leading and trailing whitespace before invoking onSearch on Enter key", () => {
+    it("trims leading and trailing whitespace before invoking onSearch on Enter key", async () => {
       const onSearch = jest.fn();
       render(<SearchBar onSearch={onSearch} />);
 
@@ -287,7 +296,7 @@ describe("SearchBar component (#4401, #4404)", () => {
         fireEvent.change(input, { target: { value: "   Coworking Hub   " } });
       });
 
-      act(() => {
+      await act(async () => {
         fireEvent.keyDown(input, { key: "Enter" });
       });
 
@@ -389,6 +398,66 @@ describe("SearchBar component (#4401, #4404)", () => {
       expect(mockFetch.mock.calls[1][0]).toContain("query=Cafe%20Roma");
     });
   });
+
+  describe("Enter key & form submission preventDefault behavior", () => {
+    it("invokes preventDefault on Enter keypress and triggers instant search filtering without page reload", async () => {
+      const onSearch = jest.fn();
+      const onQueryChange = jest.fn();
+      render(<SearchBar onSearch={onSearch} onQueryChange={onQueryChange} />);
+
+      const input = screen.getByTestId("search-bar-input");
+      act(() => {
+        fireEvent.change(input, { target: { value: "quiet cafe" } });
+      });
+
+      const enterEvent = new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        bubbles: true,
+        cancelable: true,
+      });
+      const preventDefaultSpy = jest.spyOn(enterEvent, "preventDefault");
+
+      await act(async () => {
+        input.dispatchEvent(enterEvent);
+      });
+
+      expect(preventDefaultSpy).toHaveBeenCalledTimes(1);
+      expect(enterEvent.defaultPrevented).toBe(true);
+      expect(onSearch).toHaveBeenCalledWith("quiet cafe");
+      expect(onQueryChange).toHaveBeenCalledWith("quiet cafe");
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.stringContaining("query=quiet%20cafe"),
+        expect.any(Object),
+      );
+    });
+
+    it("prevents default browser reload on form submit event and filters client-side", async () => {
+      const onSearch = jest.fn();
+      render(<SearchBar onSearch={onSearch} />);
+
+      const input = screen.getByTestId("search-bar-input");
+      const form = screen.getByTestId("search-bar-form");
+
+      act(() => {
+        fireEvent.change(input, { target: { value: "roastery" } });
+      });
+
+      const submitEvent = new Event("submit", {
+        bubbles: true,
+        cancelable: true,
+      });
+      const preventDefaultSpy = jest.spyOn(submitEvent, "preventDefault");
+
+      await act(async () => {
+        form.dispatchEvent(submitEvent);
+      });
+
+      expect(preventDefaultSpy).toHaveBeenCalledTimes(1);
+      expect(submitEvent.defaultPrevented).toBe(true);
+      expect(onSearch).toHaveBeenCalledWith("roastery");
+    });
+  });
 });
 
 describe("SearchBar AbortController & generation counter race-condition prevention", () => {
@@ -426,7 +495,6 @@ describe("SearchBar AbortController & generation counter race-condition preventi
     render(<SearchBar debounceMs={100} />);
     const input = screen.getByTestId("search-bar-input");
 
-    // Step 1: Type "caf" and let debounce dispatch request A
     act(() => {
       fireEvent.change(input, { target: { value: "caf" } });
     });
@@ -436,20 +504,17 @@ describe("SearchBar AbortController & generation counter race-condition preventi
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(signals[0].aborted).toBe(false);
 
-    // Step 2: Type "cafe" â€” useEffect cleanup aborts request A immediately
     act(() => {
       fireEvent.change(input, { target: { value: "cafe" } });
     });
     expect(signals[0].aborted).toBe(true);
 
-    // Let debounce dispatch request B ("cafe")
     await act(async () => {
       jest.advanceTimersByTime(100);
     });
     expect(global.fetch).toHaveBeenCalledTimes(2);
     expect(signals[1].aborted).toBe(false);
 
-    // Step 3: Resolve request B ("cafe") FIRST, then resolve stale request A ("caf") AFTER
     await act(async () => {
       resolveCafe({
         ok: true,
@@ -482,7 +547,6 @@ describe("SearchBar AbortController & generation counter race-condition preventi
       });
     });
 
-    // Final UI state must contain only "Cafe Milano" and never revert to "Cafeteria Stale"
     expect(screen.getByText("Cafe Milano")).toBeInTheDocument();
     expect(screen.queryByText("Cafeteria Stale")).not.toBeInTheDocument();
   });
