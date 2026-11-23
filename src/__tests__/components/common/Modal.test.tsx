@@ -1,5 +1,5 @@
-﻿import React from 'react';
-import { fireEvent, render, screen } from '@testing-library/react';
+﻿import React, { useState } from 'react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { Modal } from '@/components/common/Modal';
 
 describe('Modal focus trap', () => {
@@ -32,15 +32,32 @@ describe('Modal focus trap', () => {
     expect(document.activeElement).toBe(lastBtn);
   });
 
-  it('closes on Escape key press', () => {
-    const onClose = jest.fn();
-    render(
-      <Modal isOpen onClose={onClose} title="Review">
-        <button type="button">Submit</button>
-      </Modal>
-    );
+  it('closes on Escape key press and restores focus to the triggering element', async () => {
+    const Wrapper = () => {
+      const [open, setOpen] = useState(false);
+      return (
+        <div>
+          <button type="button" data-testid="open-modal-btn" onClick={() => setOpen(true)}>
+            Book Desk
+          </button>
+          <Modal isOpen={open} onClose={() => setOpen(false)} title="Review">
+            <button type="button">Submit</button>
+          </Modal>
+        </div>
+      );
+    };
 
+    render(<Wrapper />);
+    const triggerBtn = screen.getByTestId('open-modal-btn');
+    triggerBtn.focus();
+    fireEvent.click(triggerBtn);
+
+    expect(screen.getByTestId('modal-dialog')).toBeTruthy();
     fireEvent.keyDown(screen.getByTestId('modal-dialog'), { key: 'Escape' });
-    expect(onClose).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('modal-dialog')).toBeNull();
+      expect(document.activeElement).toBe(triggerBtn);
+    });
   });
 });

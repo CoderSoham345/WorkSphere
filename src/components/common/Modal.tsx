@@ -57,8 +57,11 @@ export const Modal: React.FC<ModalProps> = ({
 
     return () => {
       window.cancelAnimationFrame(rafId);
-      previousActiveElementRef.current?.focus();
+      const triggerEl = previousActiveElementRef.current;
       previousActiveElementRef.current = null;
+      if (triggerEl && triggerEl.isConnected) {
+        window.requestAnimationFrame(() => triggerEl.focus());
+      }
     };
   }, [isOpen]);
 
